@@ -28,7 +28,10 @@ the stable machine-readable ``reason`` of the 200 response:
    the issuer, valid at ``check_time`` and carrying the id-kp-OCSPSigning
    extended key usage.
 7. ``signature_invalid`` — the response signature does not verify with the
-   selected signer's public key.
+   selected signer's public key. RSASSA-PSS responses are verified with the
+   parameters parsed from the raw DER (explicit values and the RFC 4055
+   defaults for hash, MGF1, salt length and trailerField); malformed or
+   unsupported parameters land here too, never in an exception.
 8. ``certificate_revoked`` / ``certificate_unknown`` — the (now authentic)
    response does not certify the leaf as good. A revoked verdict also
    surfaces ``revocation_time`` and ``revocation_reason``.
@@ -47,7 +50,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.x509 import ocsp as x509_ocsp
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
@@ -59,6 +64,7 @@ from .models import (
 from .normalize import (
     FINGERPRINT_RE,
     NormalizeError,
+    _RSASSA_PSS_OID,
     _build_issuer_edges,
     _load_pem_bundle,
     _validity_utc,
@@ -144,6 +150,241 @@ def _cert_id_matches(
         response.serial_number == leaf.serial_number
         and response.issuer_name_hash == name_hash
         and response.issuer_key_hash == key_hash
+    )
+
+
+# ---------------------------------------------------------------------------
+# RSASSA-PSS signature parameters (RFC 4055 / RFC 8017)
+#
+# cryptography 44.0.3 raises UnsupportedAlgorithm for a PSS-signed response's
+# ``signature_hash_algorithm`` and exposes no OCSP
+# ``signature_algorithm_parameters``, so the RSASSA-PSS-params are parsed
+# from the raw DER of the BasicOCSPResponse instead. The parser is
+# deliberately strict — unknown hash/MGF OIDs, illegal TLV structure and
+# duplicated, mis-ordered or out-of-range fields are all rejected — and every
+# rejection is reported upstream as ``signature_invalid``; no exception leaks
+# out of signature verification.
+# ---------------------------------------------------------------------------
+
+# DER value octets (tag/length stripped) of the relevant algorithm OIDs.
+_RSASSA_PSS_OID_CONTENT = bytes.fromhex(
+    "2a864886f70d01010a")  # 1.2.840.113549.1.1.10 (id-RSASSA-PSS)
+_MGF1_OID_CONTENT = bytes.fromhex(
+    "2a864886f70d010108")  # 1.2.840.113549.1.1.8 (id-mgf1)
+_OCSP_BASIC_OID_CONTENT = bytes.fromhex(
+    "2b0601050507300101")  # 1.3.6.1.5.5.7.48.1.1 (id-pkix-ocsp-basic)
+_HASH_OID_CONTENT = {
+    bytes.fromhex("2b0e03021a"): hashes.SHA1,        # 1.3.14.3.2.26
+    bytes.fromhex("608648016503040204"): hashes.SHA224,  # 2.16.840.1.101.3.4.2.4
+    bytes.fromhex("608648016503040201"): hashes.SHA256,  # 2.16.840.1.101.3.4.2.1
+    bytes.fromhex("608648016503040202"): hashes.SHA384,  # 2.16.840.1.101.3.4.2.2
+    bytes.fromhex("608648016503040203"): hashes.SHA512,  # 2.16.840.1.101.3.4.2.3
+}
+
+# RFC 4055 defaults for omitted RSASSA-PSS-params fields.
+_PSS_DEFAULT_HASH = hashes.SHA1
+_PSS_DEFAULT_SALT_LENGTH = 20
+_PSS_TRAILER_FIELD_BC = 1
+
+
+class _PssParamsError(ValueError):
+    """Malformed or unsupported RSASSA-PSS-params (maps to signature_invalid)."""
+
+
+def _der_read(buf: bytes, off: int, limit: int) -> tuple[int, int, int]:
+    """Read one DER TLV from ``buf[off:limit]``.
+
+    Returns ``(tag, content_start, content_end)``. Raises _PssParamsError on
+    any structural violation: truncated header, indefinite or non-minimal
+    length, or content overrunning the enclosing value.
+    """
+    if off < 0 or limit > len(buf) or off + 2 > limit:
+        raise _PssParamsError("truncated TLV header")
+    tag = buf[off]
+    pos = off + 1
+    length = buf[pos]
+    pos += 1
+    if length & 0x80:
+        n = length & 0x7F
+        if n == 0 or n > 4 or pos + n > limit:
+            raise _PssParamsError("illegal TLV length")
+        if buf[pos] == 0:
+            raise _PssParamsError("non-minimal TLV length")
+        length = int.from_bytes(buf[pos:pos + n], "big")
+        pos += n
+        if length < 0x80:
+            raise _PssParamsError("non-minimal TLV length")
+    if pos + length > limit:
+        raise _PssParamsError("TLV content overruns its enclosing value")
+    return tag, pos, pos + length
+
+
+def _basic_response_signature_algorithm(der: bytes) -> bytes:
+    """Raw TLV bytes of the BasicOCSPResponse ``signatureAlgorithm`` field.
+
+    Walks OCSPResponse -> [0] responseBytes -> BasicOCSPResponse in the raw
+    DER; the parsed object model does not expose the parameters.
+    """
+    tag, c0, e0 = _der_read(der, 0, len(der))          # OCSPResponse SEQUENCE
+    if tag != 0x30 or e0 != len(der):
+        raise _PssParamsError("OCSPResponse is not one outer SEQUENCE")
+    tag, _c, e1 = _der_read(der, c0, e0)               # responseStatus
+    if tag != 0x0A:
+        raise _PssParamsError("responseStatus is not an ENUMERATED")
+    tag, c2, e2 = _der_read(der, e1, e0)               # [0] responseBytes
+    if tag != 0xA0:
+        raise _PssParamsError("responseBytes wrapper missing")
+    tag, c3, e3 = _der_read(der, c2, e2)               # ResponseBytes SEQUENCE
+    if tag != 0x30:
+        raise _PssParamsError("ResponseBytes is not a SEQUENCE")
+    tag, c4, e4 = _der_read(der, c3, e3)               # responseType OID
+    if tag != 0x06 or der[c4:e4] != _OCSP_BASIC_OID_CONTENT:
+        raise _PssParamsError("responseType is not id-pkix-ocsp-basic")
+    tag, c5, e5 = _der_read(der, e4, e3)               # response OCTET STRING
+    if tag != 0x04:
+        raise _PssParamsError("response is not an OCTET STRING")
+    tag, c6, e6 = _der_read(der, c5, e5)               # BasicOCSPResponse
+    if tag != 0x30 or e6 != e5:
+        raise _PssParamsError("BasicOCSPResponse is not a single SEQUENCE")
+    tag, _c, e7 = _der_read(der, c6, e6)               # tbsResponseData
+    if tag != 0x30:
+        raise _PssParamsError("tbsResponseData is not a SEQUENCE")
+    tag, _c, e8 = _der_read(der, e7, e6)               # signatureAlgorithm
+    if tag != 0x30:
+        raise _PssParamsError("signatureAlgorithm is not a SEQUENCE")
+    return der[e7:e8]
+
+
+def _pss_hash_algorithm(buf: bytes, start: int, end: int):
+    """Hash class named by the HashAlgorithm in ``buf[start:end]``.
+
+    The field must hold exactly one AlgorithmIdentifier SEQUENCE whose
+    parameters are absent or NULL (the only forms RFC 4055/5754 define).
+    """
+    tag, c0, e0 = _der_read(buf, start, end)
+    if tag != 0x30 or e0 != end:
+        raise _PssParamsError("hashAlgorithm is not a single SEQUENCE")
+    tag, c1, e1 = _der_read(buf, c0, e0)               # algorithm OID
+    if tag != 0x06:
+        raise _PssParamsError("hashAlgorithm carries no OID")
+    hash_cls = _HASH_OID_CONTENT.get(buf[c1:e1])
+    if hash_cls is None:
+        raise _PssParamsError("unsupported hash algorithm OID")
+    if e1 < e0:
+        tag, c2, e2 = _der_read(buf, e1, e0)           # optional parameters
+        if tag != 0x05 or c2 != e2 or e2 != e0:
+            raise _PssParamsError(
+                "hashAlgorithm parameters must be NULL or absent")
+    return hash_cls
+
+
+def _pss_mask_gen_algorithm(buf: bytes, start: int, end: int):
+    """MGF1 hash class named by the MaskGenAlgorithm in ``buf[start:end]``.
+
+    Only id-mgf1 is defined for RSASSA-PSS; its parameters (the hash the MGF
+    is keyed with) are mandatory.
+    """
+    tag, c0, e0 = _der_read(buf, start, end)
+    if tag != 0x30 or e0 != end:
+        raise _PssParamsError("maskGenAlgorithm is not a single SEQUENCE")
+    tag, c1, e1 = _der_read(buf, c0, e0)               # algorithm OID
+    if tag != 0x06 or buf[c1:e1] != _MGF1_OID_CONTENT:
+        raise _PssParamsError("unsupported mask generation function OID")
+    if e1 >= e0:
+        raise _PssParamsError("id-mgf1 requires its hash algorithm parameters")
+    return _pss_hash_algorithm(buf, e1, e0)
+
+
+def _pss_params_integer(buf: bytes, start: int, end: int, name: str) -> int:
+    """Non-negative INTEGER wrapped in the params field ``buf[start:end]``."""
+    tag, c0, e0 = _der_read(buf, start, end)
+    if tag != 0x02 or e0 != end:
+        raise _PssParamsError(f"{name} is not a single INTEGER")
+    if c0 == e0:
+        raise _PssParamsError(f"{name} INTEGER is empty")
+    body = buf[c0:e0]
+    if body[0] & 0x80:
+        raise _PssParamsError(f"{name} must not be negative")
+    if len(body) > 1 and body[0] == 0 and not body[1] & 0x80:
+        raise _PssParamsError(f"{name} INTEGER is not minimally encoded")
+    return int.from_bytes(body, "big")
+
+
+def _parse_pss_params(content: Optional[bytes]):
+    """RSASSA-PSS-params content octets -> (hash, MGF1 hash, salt length).
+
+    ``content`` is None when the AlgorithmIdentifier omits the parameters
+    element altogether. Omitted fields take their RFC 4055 defaults
+    (SHA-1, MGF1-with-SHA-1, salt length 20, trailerFieldBC); the fields that
+    are present must appear at most once, in their defined order.
+    """
+    hash_cls = _PSS_DEFAULT_HASH
+    mgf_hash_cls = _PSS_DEFAULT_HASH
+    salt_length = _PSS_DEFAULT_SALT_LENGTH
+    if content is None:
+        return hash_cls, mgf_hash_cls, salt_length
+    pos = 0
+    previous = -1
+    while pos < len(content):
+        tag, c0, e0 = _der_read(content, pos, len(content))
+        if tag not in (0xA0, 0xA1, 0xA2, 0xA3):
+            raise _PssParamsError("unknown RSASSA-PSS-params field")
+        field = tag - 0xA0
+        if field <= previous:
+            raise _PssParamsError(
+                "duplicated or mis-ordered RSASSA-PSS-params field")
+        previous = field
+        if field == 0:
+            hash_cls = _pss_hash_algorithm(content, c0, e0)
+        elif field == 1:
+            mgf_hash_cls = _pss_mask_gen_algorithm(content, c0, e0)
+        elif field == 2:
+            salt_length = _pss_params_integer(content, c0, e0, "saltLength")
+        else:
+            trailer = _pss_params_integer(content, c0, e0, "trailerField")
+            if trailer != _PSS_TRAILER_FIELD_BC:
+                raise _PssParamsError(
+                    "trailerField must be 1 (trailerFieldBC)")
+        pos = e0
+    return hash_cls, mgf_hash_cls, salt_length
+
+
+def _parse_pss_signature_algorithm(sig_alg: bytes):
+    """(hash, MGF1 hash, salt length) from a signatureAlgorithm TLV."""
+    _tag, c0, e0 = _der_read(sig_alg, 0, len(sig_alg))
+    tag, c1, e1 = _der_read(sig_alg, c0, e0)           # algorithm OID
+    if tag != 0x06 or sig_alg[c1:e1] != _RSASSA_PSS_OID_CONTENT:
+        raise _PssParamsError("signatureAlgorithm is not id-RSASSA-PSS")
+    if e1 == e0:
+        params_content = None  # parameters absent: RFC 4055 defaults
+    else:
+        tag, c2, e2 = _der_read(sig_alg, e1, e0)       # parameters
+        if tag != 0x30 or e2 != e0:
+            raise _PssParamsError(
+                "RSASSA-PSS-params are not a single SEQUENCE")
+        params_content = sig_alg[c2:e2]
+    return _parse_pss_params(params_content)
+
+
+def _pss_signature_parameters(
+    der: bytes,
+) -> Optional[tuple[hashes.HashAlgorithm, padding.PSS]]:
+    """Hash algorithm and PSS padding of a PSS-signed OCSP response.
+
+    Parsed from the raw DER because cryptography 44.0.3 cannot surface them
+    for OCSP responses. Returns None when the parameters are malformed or
+    unsupported; the caller reports that as ``signature_invalid``.
+    """
+    try:
+        sig_alg = _basic_response_signature_algorithm(der)
+        hash_cls, mgf_hash_cls, salt_length = _parse_pss_signature_algorithm(
+            sig_alg)
+    except _PssParamsError:
+        return None
+    hash_algorithm = hash_cls()
+    return hash_algorithm, padding.PSS(
+        mgf=padding.MGF1(mgf_hash_cls()),
+        salt_length=salt_length,
     )
 
 
@@ -359,13 +600,40 @@ def ocsp_precheck(req: OcspPrecheckRequest) -> OcspPrecheckResult:
     info["signer_fingerprint"] = cert_fingerprint(signer)
 
     # -- 7. the response signature must verify ----------------------------------
+    signature_oid = response.signature_algorithm_oid.dotted_string
+    if signature_oid == _RSASSA_PSS_OID:
+        # cryptography 44.0.3 raises UnsupportedAlgorithm for a PSS-signed
+        # response's signature_hash_algorithm and exposes no parameters, so
+        # the RSASSA-PSS-params are parsed from the raw DER (RFC 4055
+        # defaults included). Malformed or unsupported parameters mean the
+        # signature cannot be verified: report signature_invalid.
+        pss_parameters = _pss_signature_parameters(der)
+        if pss_parameters is None:
+            return finish(
+                "signature_invalid",
+                "the response's RSASSA-PSS signature parameters are "
+                "malformed or use an unsupported hash/MGF algorithm",
+            )
+        hash_algorithm, signature_parameters = pss_parameters
+    else:
+        try:
+            hash_algorithm = response.signature_hash_algorithm
+        except UnsupportedAlgorithm:
+            return finish(
+                "signature_invalid",
+                f"the response's signature algorithm (OID {signature_oid}) "
+                f"is not supported",
+            )
+        signature_parameters = getattr(
+            response, "signature_algorithm_parameters", None
+        )
     if not _verify_signed_data(
         signer.public_key(),
         response.signature,
         response.tbs_response_bytes,
-        response.signature_hash_algorithm,
-        response.signature_algorithm_oid.dotted_string,
-        getattr(response, "signature_algorithm_parameters", None),
+        hash_algorithm,
+        signature_oid,
+        signature_parameters,
     ):
         return finish(
             "signature_invalid",

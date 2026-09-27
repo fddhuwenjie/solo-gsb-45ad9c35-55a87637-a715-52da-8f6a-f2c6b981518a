@@ -236,6 +236,10 @@ curl -s http://localhost:8080/deployments/ocsp-precheck \
    **签发者直接签发、在 `check_time` 有效、且含 `id-kp-OCSPSigning` 扩展
    密钥用途**的响应证书（否则 `unauthorized_responder`）。
 6. **验签**：用选定签名者的公钥验证响应签名（否则 `signature_invalid`）。
+   对 RSASSA-PSS 签名的响应，参数（哈希、MGF1、盐长度、trailerField）直接从
+   原始 DER 的 `signatureAlgorithm` 解析，支持显式参数与 RFC 4055 默认值；
+   参数畸形、含未知 OID 或签名不匹配同样返回 `signature_invalid`，
+   不会向上泄露异常。
 7. **证书状态**：必须为 `good`；`revoked` 返回 `certificate_revoked` 并附
    `revocation_time` / `revocation_reason`，`unknown` 返回
    `certificate_unknown`。
